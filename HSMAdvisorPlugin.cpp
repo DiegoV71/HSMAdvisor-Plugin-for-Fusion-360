@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <mutex>
+#include <condition_variable>
 #include <regex>
 #include <thread>
 
@@ -343,6 +344,13 @@ static std::thread g_worker;
 static hsma_cancel* g_cancel = nullptr;
 static std::atomic<bool> g_stopping(false);
 
+// "Tool not found" notice.
+static const char* kToolNotFoundEventId = "HSMAdvisorToolNotFoundEvent";
+static std::mutex g_noticeLock;
+static std::condition_variable g_noticeDone;
+static std::string g_noticeText;
+static bool g_noticeShown = false;
+
 // This add-in's version (from its manifest).
 static std::string pluginVersion()
 {
@@ -635,6 +643,7 @@ struct HsmRequest
     double stickout = 0, docIn = 0, wocIn = 0, rampAngle = 0;
     int flutes = 0;
     bool rampHelix = false;
+    bool metric = true;
     long long ownerWindow = 0;
 };
 
@@ -740,12 +749,12 @@ static bool findLibraryTool(const HsmRequest& r, hsma_cancel* cancel, json& tool
 }
 
 // ---- last-used settings ------------------------------------------------------------------------
-// Material / machine / productivity / HSM mode / units the user last chose, in the add-in folder.
+// Material / machine / productivity / HSM mode the user last chose, in the add-in folder.
+// Units are not remembered: the dialog follows the Fusion document's units.
 
 struct LastSettings
 {
     std::string materialId, machineId, productivity, hss;
-    bool metric = true;
 };
 
 static std::string settingsPath() { return addinFolder() + "\\settings.txt"; }
@@ -779,7 +788,6 @@ static LastSettings loadLastSettings()
         s.machineId = kvGet(m, "machine_id", "");
         s.productivity = kvGet(m, "productivity", "");
         s.hss = kvGet(m, "hss", "");
-        s.metric = kvGet(m, "metric", "1") == "1";
         return s;
     }
     std::string xml = readFile(addinFolder() + "\\settings.xml"); // written by versions up to 0.4
@@ -789,7 +797,6 @@ static LastSettings loadLastSettings()
         s.machineId = xmlTag(xml, "machine_id");
         s.productivity = xmlTag(xml, "productivity");
         s.hss = xmlTag(xml, "hsm");
-        s.metric = xmlTag(xml, "metric") != "0";
     }
     return s;
 }
@@ -803,7 +810,6 @@ static void saveLastSettings(const json& cut)
     if (!jstr(cut, "machine_id").empty()) f << "machine_id=" << jstr(cut, "machine_id") << "\n";
     if (!jstr(cut, "productivity").empty()) f << "productivity=" << jstr(cut, "productivity") << "\n";
     f << "hss=" << (jstr(cut, "high_speed_machining") == "1" ? "1" : "0") << "\n";
-    f << "metric=" << (jstr(cut, "input_units_mm") == "0" ? "0" : "1") << "\n";
 }
 
 // ---- the request ---------------------------------------------------------------------------------
@@ -861,14 +867,24 @@ static KvMap processRequest(const HsmRequest& r, hsma_cancel* cancel)
         cut["circle_comp"] = "1";
     }
 
-    // Open where the previous run left off: material, machine, productivity, HSM, units.
+    // Open where the previous run left off: material, machine, productivity, HSM.
     LastSettings last = loadLastSettings();
     cut["material_id"] = last.materialId.empty() ? "227" : last.materialId; // default until one is picked
     cut["productivity"] = last.productivity.empty() ? "4" : last.productivity; // slider -> x1.0
     if (!last.machineId.empty()) cut["machine_id"] = last.machineId;
     if (!last.hss.empty()) cut["high_speed_machining"] = last.hss;
-    cut["input_units_mm"] = last.metric ? "1" : "0";
-    cut["result_units_mm"] = last.metric ? "1" : "0";
+    for (const char* flag : { "input_units_mm", "result_units_mm", "feed_mm", "sfm_mm", "ipt_mm", "peck_mm", "depth_mm" })
+        cut[flag] = "1";
+
+    json seed = { { "calculation", { { "tool", tool }, { "cut", cut } } }, { "metric", r.metric } };
+    HsmResult seeded = hsmRequest("ConvertUnits", &seed, 0, cancel);
+    if (seeded.status == HSMA_CANCELLED || (seeded.status != HSMA_OK && isClientFailure(seeded))) return fail(seeded);
+    if (seeded.status == HSMA_OK && seeded.payload.contains("calculation") && seeded.payload["calculation"].is_object())
+    {
+        const json& c = seeded.payload["calculation"];
+        if (c.contains("tool") && c["tool"].is_object()) tool = c["tool"];
+        if (c.contains("cut") && c["cut"].is_object()) cut = c["cut"];
+    }
 
     // 3. The HSMAdvisor calculator, owned by Fusion's window.
     std::string prompt = "Select workpiece material and machine, then click OK to apply to Fusion.";
@@ -877,6 +893,26 @@ static KvMap processRequest(const HsmRequest& r, hsma_cancel* cancel)
         std::string desc = trimmed(r.description), pid = trimmed(r.productId);
         prompt = "Tool not found in your HSMAdvisor library (" + (desc.empty() ? std::string("no description") : desc) +
                  (pid.empty() ? std::string() : ", " + pid) + "). Check the tool and cut values, then click OK to apply to Fusion.";
+
+        {
+            std::lock_guard<std::mutex> guard(g_noticeLock);
+            g_noticeText = "Tool not found in your HSMAdvisor library: " + (desc.empty() ? std::string("(no description)") : desc) +
+                           (pid.empty() ? std::string() : ", " + pid) +
+                           ".\nHSMAdvisor will open with the tool geometry from Fusion.";
+            g_noticeShown = false;
+        }
+       
+        if (app && !g_stopping)
+        {
+            app->fireCustomEvent(kToolNotFoundEventId, "");
+            std::unique_lock<std::mutex> lock(g_noticeLock);
+            g_noticeDone.wait(lock, [] { return g_noticeShown || g_stopping; });
+        }
+        if (g_stopping)
+        {
+            out["status"] = "cancel";
+            return out;
+        }
     }
     // tool_is_new defaults to true: a library tool must say it is not, or auto-save adds it twice.
     json edit = { { "calculation", { { "tool", tool }, { "cut", cut }, { "tool_is_new", !found } } }, { "prompt", prompt }, { "calculate_first", true } };
@@ -1000,7 +1036,11 @@ static void startHsmAdvisorClient()
 // HSMAdvisor itself exits a few seconds after Fusion is gone.
 static void stopHsmAdvisorClient()
 {
-    g_stopping = true;
+    {
+        std::lock_guard<std::mutex> guard(g_noticeLock);
+        g_stopping = true;
+    }
+    g_noticeDone.notify_all();
     if (g_cancel) g_hsma.cancel_signal(g_cancel);
     finishWorker();
     if (g_updateThread.joinable()) g_updateThread.join();
@@ -1344,6 +1384,27 @@ public:
 };
 static HostDoneHandler g_onHostDone;
 
+class ToolNotFoundHandler : public CustomEventHandler
+{
+public:
+    void notify(const Ptr<CustomEventArgs>& /*args*/) override
+    {
+        std::string text;
+        {
+            std::lock_guard<std::mutex> guard(g_noticeLock);
+            text = g_noticeText;
+        }
+        if (ui && !text.empty() && !g_stopping)
+            ui->messageBox(text, "HSMAdvisor Plugin", OKButtonType, InformationIconType);
+        {
+            std::lock_guard<std::mutex> guard(g_noticeLock);
+            g_noticeShown = true;
+        }
+        g_noticeDone.notify_all();
+    }
+};
+static ToolNotFoundHandler g_onToolNotFound;
+
 // --- single results dialog: a checkbox + old + new per parameter -------------
 class ApplyExecuteHandler : public CommandEventHandler
 {
@@ -1602,7 +1663,11 @@ public:
         req.wocIn = wocIn;
         req.rampAngle = rampAngle;
         req.rampHelix = isHelixRamp;
-        req.ownerWindow = fusionMainWindow();
+        req.metric = readBool(ops, "metric", true);
+        // Stopgap: pass no owner window so HSMAdvisor's dialog does not block Fusion.
+        // When owned by Fusion's main window the dialog is modal and freezes Fusion; unowned it is
+        // non-modal (Fusion stays usable) but can fall behind Fusion.
+        req.ownerWindow = 0;
 
         g_pendingOp = op;
         g_hostBusy = true;
@@ -1648,6 +1713,9 @@ extern "C" XI_EXPORT bool run(const char* context)
     Ptr<CustomEvent> ce = app->registerCustomEvent(kHostDoneEventId);
     if (ce)
         ce->add(&g_onHostDone);
+    Ptr<CustomEvent> notFound = app->registerCustomEvent(kToolNotFoundEventId);
+    if (notFound)
+        notFound->add(&g_onToolNotFound);
 
     Ptr<CommandDefinitions> cmdDefs = ui->commandDefinitions();
     if (!cmdDefs)
@@ -1731,7 +1799,10 @@ extern "C" XI_EXPORT bool stop(const char* context)
     stopHsmAdvisorClient(); // closes an open HSMAdvisor dialog of this add-in
 
     if (app)
+    {
         app->unregisterCustomEvent(kHostDoneEventId);
+        app->unregisterCustomEvent(kToolNotFoundEventId);
+    }
 
     return true;
 }
