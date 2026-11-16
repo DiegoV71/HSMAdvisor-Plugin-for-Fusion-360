@@ -613,7 +613,7 @@ static int fieldsFor(int tt)
 {
     switch (tt)
     {
-    case TT_Tap:           return 0; // nothing is written for a tap for now
+    case TT_Tap:           return G_Flutes | G_Pitch | G_Shank | G_Stickout;
     case TT_Unknown:       return 0; // unmapped Fusion types: write nothing
     case TT_CounterSink:   return G_Dia | G_TipDia | G_Flutes | G_Shank | G_Angle | G_Stickout;
     case TT_ChamferMill:
@@ -643,7 +643,8 @@ struct HsmRequest
     double stickout = 0, docIn = 0, wocIn = 0, rampAngle = 0;
     int flutes = 0;
     bool rampHelix = false;
-    bool metric = true;
+    bool metric = true;     // operation/document units
+    bool toolMetric = true; // the TOOL's own unit system
     long long ownerWindow = 0;
 };
 
@@ -652,6 +653,25 @@ static void setMm(json& record, const char* name, const char* flag, double mm)
 {
     record[name] = numToStr(mm, 4);
     record[flag] = "1";
+}
+
+// HSMAdvisor's thread-form name for a tap.
+static std::string tapThreadForm(const std::string& description, bool toolUnitMetric)
+{
+    std::string d = toLower(description);
+    // Longest / most specific first so "UNEF"/"UNC" win over the bare "UN" series.
+    static const struct { const char* token; const char* form; } forms[] = {
+        { "unef", "UNEF" }, { "unf", "UNF" }, { "unc", "UNC" }, { "uns", "UNS" }, { "un", "UN" },
+    };
+    for (const auto& f : forms)
+        if (d.find(f.token) != std::string::npos) return f.form;
+    for (size_t i = 0; i < d.size(); ++i)
+    {
+        bool boundary = (i == 0) || !(d[i - 1] >= 'a' && d[i - 1] <= 'z');
+        bool digit = (i + 1 < d.size()) && d[i + 1] >= '0' && d[i + 1] <= '9';
+        if (d[i] == 'm' && boundary && digit) return "ISO";
+    }
+    return toolUnitMetric ? "ISO" : "";
 }
 
 // The tool record from Fusion's geometry.
@@ -679,6 +699,12 @@ static json toolGeometry(const HsmRequest& r)
     {
         tool["thread_pitch"] = numToStr(r.threadPitch, 4);
         tool["thread_pitch_m"] = "1";
+    }
+    // For a metric tap, pre-select the thread standard
+    if (tt == TT_Tap)
+    {
+        std::string form = tapThreadForm(r.description, r.toolMetric);
+        if (!form.empty()) tool["thread_form"] = form;
     }
 
     std::string tl = toLower(r.toolType);
@@ -1188,6 +1214,8 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
 
     // If is drilling operations then set feed as plunge feed, otherwise set as cutting feed.
     bool isDrill = (toLower(op->strategy()) == "drill");
+    // Tapping feed is locked to thread pitch x spindle speed (Fusion derives it), so apply RPM only.
+    bool isTap = readBool(ops, "isTappingOperation", false);
     bool isChamfer = isChamferEngagement(op);
     const std::string feedParam = isDrill ? "tool_feedPlunge" : "tool_feedCutting";
 
@@ -1239,7 +1267,7 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
         add("rpm", "tool_spindleSpeed", numToStr((double)rpm, 0) + " rpm",
             { { "tool_spindleSpeed", rpmExpr } }, g_apply.all || g_apply.rpm);
 
-    if (feedCut > 0.0 && hasParam(ops, feedParam))
+    if (feedCut > 0.0 && !isTap && hasParam(ops, feedParam))
     {
         // The row shows the primary feed parameter; for milling the same value also goes
         // to entry/exit/transition.
@@ -1288,7 +1316,7 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     // chamferWidth.
     if (isDrill)
     {
-        if (peck > 0.0)
+        if (peck > 0.0 && !isTap)
         {
             if (hasParam(ops, "peckingDepth"))
                 add("ad", "peckingDepth", lenNew(peck), { { "peckingDepth", numToStr(peck, 3) + "mm" } }, g_apply.all || g_apply.ad);
@@ -1589,6 +1617,7 @@ public:
 
         std::string toolType = readChoice(tp, "tool_type", "flat end mill");
         std::string toolMat  = readChoice(tp, "tool_material", "unspecified");
+        bool toolMetric = readChoice(tp, "tool_unit", "millimeters") != "inches";
         std::string toolDesc = readString(tp, "tool_description");
         std::string toolPid  = readString(tp, "tool_productId");
         std::string opStrategy = op->strategy(); //used to pick tool type
@@ -1664,6 +1693,7 @@ public:
         req.rampAngle = rampAngle;
         req.rampHelix = isHelixRamp;
         req.metric = readBool(ops, "metric", true);
+        req.toolMetric = toolMetric;
         // Stopgap: pass no owner window so HSMAdvisor's dialog does not block Fusion.
         // When owned by Fusion's main window the dialog is modal and freezes Fusion; unowned it is
         // non-modal (Fusion stays usable) but can fall behind Fusion.
