@@ -971,6 +971,7 @@ static KvMap processRequest(const HsmRequest& r, hsma_cancel* cancel)
     out["sfm"] = jstr(resultCut, "sfm");
     out["chipload"] = jstr(resultCut, "ipt");
     out["rampAngleOut"] = jstr(resultCut, "ramp");
+    out["circleComp"] = jstr(resultCut, "circle_comp");
 
     // Attach update info if a newer release was found by now.
     std::lock_guard<std::mutex> guard(g_updateLock);
@@ -1200,6 +1201,7 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     double woc        = strtod(kvGet(out, "woc", "0").c_str(), nullptr);
     double peck       = strtod(kvGet(out, "peck", "0").c_str(), nullptr);
     double rampOut    = strtod(kvGet(out, "rampAngleOut", "0").c_str(), nullptr); // HSM ramp angle
+    bool   circleRamp = kvGet(out, "circleComp", "0") == "1";
 
     Ptr<CAMParameters> ops = op->parameters();
     if (!ops)
@@ -1304,10 +1306,10 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     }
 
     // Switch the operation to a helix ramp and push HSMAdvisor's ramp angle (res.Ramp) into Fusion.
-    if (hasParam(ops, "rampType"))
+    if (circleRamp && hasParam(ops, "rampType"))
         add("rampType", "rampType", "helix", { { "rampType", "helix" } },
             g_apply.all || g_apply.rampType);
-    if (rampOut > 0.0 && hasParam(ops, "rampAngle"))
+    if (circleRamp && rampOut > 0.0 && hasParam(ops, "rampAngle"))
         add("rampAngle", "rampAngle", numToStr(rampOut, 3) + " deg",
             { { "rampAngle", numToStr(rampOut, 3) + "deg" } }, g_apply.all || g_apply.rampAngle);
 
