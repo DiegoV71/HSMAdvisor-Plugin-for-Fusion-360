@@ -967,7 +967,13 @@ static KvMap processRequest(const HsmRequest& r, hsma_cancel* cancel)
     out["feedPlunge"] = jstr(resultCut, "feed_plunge");
     out["doc"] = jstr(resultCut, "doc");
     out["woc"] = jstr(resultCut, "woc");
-    out["peck"] = jstr(resultCut, "peck");
+    // ConvertUnits zeroes the peck, so take it from the EditCalculation cut and normalize to mm
+    {
+        json ec = calculation.is_object() && calculation.contains("cut") ? calculation["cut"] : json::object();
+        double peckMm = strtod(jstr(ec, "peck").c_str(), nullptr);
+        if (jstr(ec, "peck_mm") == "0") peckMm *= 25.4;
+        out["peck"] = numToStr(peckMm, 4);
+    }
     out["sfm"] = jstr(resultCut, "sfm");
     out["chipload"] = jstr(resultCut, "ipt");
     out["rampAngleOut"] = jstr(resultCut, "ramp");
